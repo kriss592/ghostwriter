@@ -9,6 +9,7 @@ use evdev::{uinput::VirtualDevice, AttributeSet, EventType as EvdevEventType, In
 pub struct Keyboard {
     device: Option<VirtualDevice>,
     key_map: HashMap<char, (EvdevKey, bool)>,
+    altgr_map: HashMap<char, EvdevKey>,
     progress_count: u32,
     no_draw_progress: bool,
 }
@@ -17,9 +18,22 @@ impl Keyboard {
     pub fn new(no_draw: bool, no_draw_progress: bool) -> Self {
         let device = if no_draw { None } else { Some(Self::create_virtual_device()) };
 
+        // Keyboard layout configured on the reMarkable (Settings). The virtual keyboard
+        // sends raw key codes, so they must match the layout xochitl uses to interpret them.
+        // Set GHOSTWRITER_KEYBOARD_LAYOUT=no for a Norwegian layout (enables æ, ø, å).
+        let layout = std::env::var("GHOSTWRITER_KEYBOARD_LAYOUT").unwrap_or_default().to_lowercase();
+        let (key_map, altgr_map) = match layout.as_str() {
+            "no" | "nb" | "nn" | "nor" | "norwegian" => {
+                debug!("Using Norwegian keyboard layout");
+                Self::create_key_map_no()
+            }
+            _ => (Self::create_key_map(), HashMap::new()),
+        };
+
         Self {
             device,
-            key_map: Self::create_key_map(),
+            key_map,
+            altgr_map,
             progress_count: 0,
             no_draw_progress,
         }
@@ -89,6 +103,10 @@ impl Keyboard {
 
         keys.insert(EvdevKey::KEY_LEFTCTRL);
         keys.insert(EvdevKey::KEY_LEFTALT);
+
+        // Needed for non-US layouts: the extra ISO key (< > on Nordic) and AltGr
+        keys.insert(EvdevKey::KEY_102ND);
+        keys.insert(EvdevKey::KEY_RIGHTALT);
 
         VirtualDevice::builder()
             .unwrap()
@@ -218,6 +236,63 @@ impl Keyboard {
         key_map
     }
 
+    /// Key map for the Norwegian layout. Letters, digits and whitespace are shared with
+    /// the US map; punctuation moves, and æ/ø/å get their own keys. Characters that need
+    /// AltGr go in the second map. Dead keys (^ ~ ` ´ ¨) are left out.
+    fn create_key_map_no() -> (HashMap<char, (EvdevKey, bool)>, HashMap<char, EvdevKey>) {
+        let mut key_map: HashMap<char, (EvdevKey, bool)> = Self::create_key_map()
+            .into_iter()
+            .filter(|(c, _)| c.is_ascii_alphanumeric() || matches!(*c, ' ' | '\t' | '\n' | '\x08' | '\x1b'))
+            .collect();
+
+        let shifted_digits = [
+            ('!', EvdevKey::KEY_1),
+            ('"', EvdevKey::KEY_2),
+            ('#', EvdevKey::KEY_3),
+            ('¤', EvdevKey::KEY_4),
+            ('%', EvdevKey::KEY_5),
+            ('&', EvdevKey::KEY_6),
+            ('/', EvdevKey::KEY_7),
+            ('(', EvdevKey::KEY_8),
+            (')', EvdevKey::KEY_9),
+            ('=', EvdevKey::KEY_0),
+        ];
+        for (c, k) in shifted_digits {
+            key_map.insert(c, (k, true));
+        }
+
+        let pairs = [
+            // (unshifted, shifted, key)
+            ('|', '§', EvdevKey::KEY_GRAVE),
+            ('+', '?', EvdevKey::KEY_MINUS),
+            ('å', 'Å', EvdevKey::KEY_LEFTBRACE),
+            ('ø', 'Ø', EvdevKey::KEY_SEMICOLON),
+            ('æ', 'Æ', EvdevKey::KEY_APOSTROPHE),
+            ('\'', '*', EvdevKey::KEY_BACKSLASH),
+            ('<', '>', EvdevKey::KEY_102ND),
+            (',', ';', EvdevKey::KEY_COMMA),
+            ('.', ':', EvdevKey::KEY_DOT),
+            ('-', '_', EvdevKey::KEY_SLASH),
+        ];
+        for (lower, upper, k) in pairs {
+            key_map.insert(lower, (k, false));
+            key_map.insert(upper, (k, true));
+        }
+        key_map.insert('\\', (EvdevKey::KEY_EQUAL, false));
+
+        let mut altgr_map = HashMap::new();
+        altgr_map.insert('@', EvdevKey::KEY_2);
+        altgr_map.insert('£', EvdevKey::KEY_3);
+        altgr_map.insert('$', EvdevKey::KEY_4);
+        altgr_map.insert('€', EvdevKey::KEY_E);
+        altgr_map.insert('{', EvdevKey::KEY_7);
+        altgr_map.insert('[', EvdevKey::KEY_8);
+        altgr_map.insert(']', EvdevKey::KEY_9);
+        altgr_map.insert('}', EvdevKey::KEY_0);
+
+        (key_map, altgr_map)
+    }
+
     pub fn key_down(&mut self, key: EvdevKey) -> Result<()> {
         if let Some(device) = &mut self.device {
             device.emit(&[(InputEvent::new(EvdevEventType::KEY.0, key.code(), 1))])?;
@@ -243,7 +318,14 @@ impl Keyboard {
             thread::sleep(time::Duration::from_millis(10));
 
             for c in input.chars() {
-                if let Some(&(key, shift)) = self.key_map.get(&c) {
+                if let Some(&key) = self.altgr_map.get(&c) {
+                    device.emit(&[InputEvent::new(EvdevEventType::KEY.0, EvdevKey::KEY_RIGHTALT.code(), 1)])?;
+                    device.emit(&[InputEvent::new(EvdevEventType::KEY.0, key.code(), 1)])?;
+                    device.emit(&[InputEvent::new(EvdevEventType::KEY.0, key.code(), 0)])?;
+                    device.emit(&[InputEvent::new(EvdevEventType::KEY.0, EvdevKey::KEY_RIGHTALT.code(), 0)])?;
+                    device.emit(&[InputEvent::new(EvdevEventType::SYNCHRONIZATION.0, 0, 0)])?;
+                    thread::sleep(time::Duration::from_millis(10));
+                } else if let Some(&(key, shift)) = self.key_map.get(&c) {
                     if shift {
                         // Press Shift
                         device.emit(&[InputEvent::new(EvdevEventType::KEY.0, EvdevKey::KEY_LEFTSHIFT.code(), 1)])?;
@@ -307,7 +389,7 @@ impl Keyboard {
             return Ok(());
         }
         self.string_to_keypresses(note)?;
-        self.progress_count += note.len() as u32;
+        self.progress_count += note.chars().count() as u32;
         Ok(())
     }
 
@@ -321,5 +403,23 @@ impl Keyboard {
         }
         self.progress_count = 0;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn norwegian_layout_maps_nordic_letters_and_moved_punctuation() {
+        let (map, altgr) = Keyboard::create_key_map_no();
+        assert_eq!(map.get(&'æ'), Some(&(EvdevKey::KEY_APOSTROPHE, false)));
+        assert_eq!(map.get(&'Ø'), Some(&(EvdevKey::KEY_SEMICOLON, true)));
+        assert_eq!(map.get(&'å'), Some(&(EvdevKey::KEY_LEFTBRACE, false)));
+        assert_eq!(map.get(&'-'), Some(&(EvdevKey::KEY_SLASH, false)));
+        assert_eq!(map.get(&'?'), Some(&(EvdevKey::KEY_MINUS, true)));
+        assert_eq!(map.get(&'a'), Some(&(EvdevKey::KEY_A, false)));
+        assert_eq!(altgr.get(&'@'), Some(&EvdevKey::KEY_2));
+        assert!(!map.contains_key(&'@'));
     }
 }
